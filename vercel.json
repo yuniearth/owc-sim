@@ -1,0 +1,1 @@
+{"functions":{"api/optimize.py":{"maxDuration":60},"api/simulate.py":{"maxDuration":30}}}

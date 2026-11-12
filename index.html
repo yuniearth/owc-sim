@@ -1,0 +1,69 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OWC 시뮬레이터</title>
+<style>
+:root{--bg:#f6f7f9;--fg:#1c2330;--card:#fff;--bd:#d9dde5;--ac:#1668c7}
+@media(prefers-color-scheme:dark){:root{--bg:#12161d;--fg:#e4e8ef;--card:#1b212b;--bd:#323a48;--ac:#5aa2ff}}
+body{margin:0;font:14px system-ui,sans-serif;background:var(--bg);color:var(--fg)}
+main{display:grid;grid-template-columns:300px 1fr;gap:12px;padding:12px;max-width:1300px;margin:auto}
+@media(max-width:800px){main{grid-template-columns:1fr}}
+.c{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:12px}
+label{display:block;margin:6px 0 2px;font-size:12px}input[type=range],select,input[type=number]{width:100%}
+button{background:var(--ac);color:#fff;border:0;border-radius:6px;padding:8px 10px;margin:6px 4px 0 0;cursor:pointer}
+canvas{width:100%;height:150px;display:block}#scene{height:230px}h3{margin:4px 0 6px;font-size:13px}
+table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid var(--bd);padding:3px 4px;text-align:right}th:first-child,td:first-child{text-align:left}
+</style></head><body><main>
+<div class="c"><h3>파도</h3>
+<label>유형</label><select id="kind"><option value="irregular">불규칙파 (Bretschneider)</option><option value="regular">규칙파</option></select>
+<label>파고 H(m) <b id="Hv"></b></label><input id="H" type="range" min=".3" max="2.5" step=".1" value="1">
+<label>주기 T(s) <b id="Tv"></b></label><input id="T" type="range" min="4" max="14" step=".5" value="10">
+<label>난수 시드</label><input id="seed" type="number" value="1">
+<h3 style="margin-top:12px">밸브 제어</h3>
+<label>모드</label><select id="mode"><option value="baseline">일반 제어 (밸브 상시 개방)</option><option value="predictive">예측 기반 래칭</option></select>
+<div id="sl"></div>
+<button id="run">시뮬레이션</button><button id="opt">베이지안 최적화</button>
+<div id="st" style="margin-top:6px;font-size:12px"></div></div>
+<div><div class="c"><canvas id="scene"></canvas>
+<label>재생 속도 <input id="spd" type="range" min=".5" max="8" step=".5" value="2" style="width:150px"></label></div>
+<div class="c" style="margin-top:12px"><h3>파면 η_w / 수주 η_c (m)</h3><canvas id="p1"></canvas><h3>챔버 게이지압 (Pa) · 터빈 rpm</h3><canvas id="p2"></canvas>
+<h3>전기 출력 / 공력 / 우회 손실 (W)</h3><canvas id="p3"></canvas><h3>밸브 개도 (유입·유출) · 주기 예측</h3><canvas id="p4"></canvas></div>
+<div class="c" style="margin-top:12px"><h3>효율 비교 대시보드</h3><table id="tb"></table><canvas id="bar" style="height:120px"></canvas><canvas id="conv" style="height:120px"></canvas></div></div>
+</main><script>
+const $=id=>document.getElementById(id);
+const P=[['po','유출밸브 개방 위상',0,1,.01,0],['do','유출밸브 개방 지속(주기비)',.1,1,.01,1],['pi','유입밸브 개방 위상',0,1,.01,0],['di','유입밸브 개방 지속(주기비)',.1,1,.01,1],['pr','릴리프 압력(Pa)',2000,20000,100,20000]];
+P.forEach(p=>$('sl').insertAdjacentHTML('beforeend',`<label>${p[1]} <b id="${p[0]}v"></b></label><input id="${p[0]}" type="range" min="${p[2]}" max="${p[3]}" step="${p[4]}" value="${p[5]}">`));
+const sync=()=>{['H','T',...P.map(p=>p[0])].forEach(i=>$(i+'v').textContent=$(i).value)};document.querySelectorAll('input').forEach(e=>e.oninput=sync);sync();
+const wave=()=>({kind:$('kind').value,H:+$('H').value,T:+$('T').value,seed:+$('seed').value});
+const xs=()=>P.map(p=>+$(p[0]).value);
+const post=(u,b)=>fetch(u,{method:'POST',body:JSON.stringify(b)}).then(r=>r.json());
+let D=null,t0=0,rows={};
+function plot(cv,ser,cur,lo,hi){const c=$(cv),x=c.getContext('2d'),W=c.width=c.clientWidth*2,Hh=c.height=c.clientHeight*2;x.clearRect(0,0,W,Hh);
+ let a=lo??Math.min(...ser.flatMap(s=>s.y)),b=hi??Math.max(...ser.flatMap(s=>s.y));if(a==b)b=a+1;const n=ser[0].y.length;
+ ser.forEach(s=>{x.strokeStyle=s.c;x.lineWidth=2;x.beginPath();s.y.forEach((v,i)=>{const X=i/n*W,Y=Hh-(v-a)/(b-a)*(Hh-8)-4;i?x.lineTo(X,Y):x.moveTo(X,Y)});x.stroke()});
+ x.strokeStyle='#888';x.beginPath();x.moveTo(cur/n*W,0);x.lineTo(cur/n*W,Hh);x.stroke();x.fillStyle='#888';x.font='20px sans-serif';x.fillText(a.toFixed(1)+' ~ '+b.toFixed(1),6,20)}
+function draw(i){const s=D.series,c=$('scene'),x=c.getContext('2d'),W=c.width=c.clientWidth*2,Hh=c.height=c.clientHeight*2;x.clearRect(0,0,W,Hh);
+ const bx=W*.45,bw=W*.3,top=Hh*.15,bh=Hh*.7,ref=top+bh*.55,sc=bh*.22,eta=s.eta[i];
+ x.fillStyle='#4aa3df';x.fillRect(0,ref-s.ew[i]*sc,bx,Hh);x.fillRect(bx+bw,ref,W-bx-bw,Hh);
+ const pg=s.p[i],k=Math.min(Math.abs(pg)/8000,1);x.fillStyle=pg>0?`rgba(220,80,60,${.15+.5*k})`:`rgba(60,100,220,${.15+.5*k})`;x.fillRect(bx,top,bw,bh);
+ x.fillStyle='#2f86c8';x.fillRect(bx,ref-eta*sc,bw,Hh);x.strokeStyle='#888';x.lineWidth=4;x.strokeRect(bx,top,bw,bh+Hh*.15);
+ const v=(px,th,l)=>{x.fillStyle=th>.5?'#2aa84a':'#d64545';x.fillRect(px,top-14,W*.07,14*(.3+th));x.fillStyle='#888';x.font='20px sans-serif';x.fillText(l,px,top-22)};
+ v(bx+10,s.thi[i],'유입');v(bx+bw-W*.07-10,s.tho[i],'유출');
+ const tx=bx+bw+W*.1,ty=top-6,ang=(s.t[i]*s.w[i]*.4);x.save();x.translate(tx,ty+30);x.rotate(ang);x.strokeStyle='#e0a020';x.lineWidth=6;for(let j=0;j<6;j++){x.rotate(Math.PI/3);x.beginPath();x.moveTo(0,0);x.lineTo(0,34);x.stroke()}x.restore();
+ x.fillStyle='#888';x.font='22px sans-serif';x.fillText(`P_el ${s.Pel[i].toFixed(0)} W   ω ${(s.w[i]*9.549).toFixed(0)} rpm   p ${pg.toFixed(0)} Pa`,10,Hh-10);
+ plot('p1',[{y:s.ew,c:'#4aa3df'},{y:s.eta,c:'#e0702a'}],i);plot('p2',[{y:s.p,c:'#c44'},{y:s.w.map(w=>w*9.549),c:'#999'}],i);
+ plot('p3',[{y:s.Pel,c:'#2aa84a'},{y:s.Pa,c:'#1668c7'},{y:s.Pb,c:'#c44'}],i);plot('p4',[{y:s.tho,c:'#2aa84a'},{y:s.thi,c:'#1668c7'},{y:s.Th.map(t=>t/15),c:'#999'}],i,0,1.1)}
+function loop(ts){if(D){const n=D.series.t.length,i=Math.floor((ts-t0)/1000*$('spd').value*20)%n;draw(i)}requestAnimationFrame(loop)}requestAnimationFrame(loop);
+async function run(label){$('st').textContent='계산 중...';const r=await post('/api/simulate',{wave:wave(),mode:$('mode').value,x:xs()});D=r;t0=performance.now();rows[label||$('mode').value]=r;table();
+ $('st').textContent=`평균 P_el ${r.P_el.toFixed(0)} W, 효율 ${(r.eff*100).toFixed(1)}%, 주기 예측 MAE ${r.period_mae?.toFixed(2)} s`}
+function table(){const e=Object.entries(rows);$('tb').innerHTML='<tr><th>제어</th><th>P_el(W)</th><th>P_공력</th><th>P_우회</th><th>효율%</th><th>p_rms</th></tr>'+e.map(([k,r])=>`<tr><td>${k}</td><td>${r.P_el.toFixed(0)}</td><td>${r.P_aero.toFixed(0)}</td><td>${r.P_bypass.toFixed(0)}</td><td>${(r.eff*100).toFixed(2)}</td><td>${r.p_rms.toFixed(0)}</td></tr>`).join('');
+ const c=$('bar'),x=c.getContext('2d'),W=c.width=c.clientWidth*2,Hh=c.height=c.clientHeight*2;x.clearRect(0,0,W,Hh);const m=Math.max(...e.map(a=>a[1].P_el),1);
+ e.forEach(([k,r],i)=>{const w=W/e.length;x.fillStyle=['#888','#1668c7','#2aa84a'][i%3];const h=r.P_el/m*(Hh-40);x.fillRect(i*w+20,Hh-h-4,w-40,h);x.fillStyle='#888';x.font='22px sans-serif';x.fillText(k+' '+r.P_el.toFixed(0)+'W',i*w+24,Hh-h-10)})}
+$('run').onclick=()=>run();
+$('opt').onclick=async()=>{$('st').textContent='베이지안 최적화 중 (약 10~60초)...';const r=await post('/api/optimize',{wave:wave()});
+ P.forEach((p,i)=>{$(p[0]).value=r.x[i]});sync();$('mode').value='predictive';
+ const b=r.validation.map(v=>v.baseline),o=r.validation.map(v=>v.optimized),m=a=>a.reduce((s,v)=>s+v)/a.length;
+ await run('최적(BO)');rows['검증 일반']={...D,P_el:m(b)};rows['검증 최적']={...D,P_el:m(o)};table();
+ const c=$('conv'),x=c.getContext('2d'),W=c.width=c.clientWidth*2,Hh=c.height=c.clientHeight*2,y=r.history.map(h=>h.best),lo=Math.min(...y),hi=Math.max(...y)||1;x.clearRect(0,0,W,Hh);x.strokeStyle='#1668c7';x.lineWidth=3;x.beginPath();
+ y.forEach((v,i)=>{const X=i/(y.length-1)*W,Y=Hh-(v-lo)/(hi-lo+1e-9)*(Hh-30)-10;i?x.lineTo(X,Y):x.moveTo(X,Y)});x.stroke();x.fillStyle='#888';x.font='22px sans-serif';x.fillText('BO 수렴(최고 P_el): '+lo.toFixed(0)+' → '+hi.toFixed(0)+' W  |  다른 시드 3개 검증 평균 일반 '+m(b).toFixed(0)+' vs 최적 '+m(o).toFixed(0)+' W',8,22);
+ $('st').textContent='최적화 완료 (슬라이더에 최적값 반영)'};
+run();
+</script></body></html>
